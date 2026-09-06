@@ -1,0 +1,2 @@
+const { EmbedBuilder } = require('discord.js');
+module.exports = { name: 'clear', aliases: ['purge'], description: 'Clear messages', category: 'moderation', permissions: ['MANAGE_MESSAGES'], async execute(message, args) { if (!message.member.permissions.has('MANAGE_MESSAGES')) return message.reply('No permission'); const amount = parseInt(args[0]) || 10; if (amount < 1 || amount > 100) return message.reply('Amount must be 1-100'); await message.channel.bulkDelete(amount + 1); message.reply(`✅ Deleted ${amount} messages`).then(m => setTimeout(() => m.delete(), 3000)); }};
