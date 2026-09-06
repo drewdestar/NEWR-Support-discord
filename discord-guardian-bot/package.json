@@ -1,0 +1,26 @@
+{
+  "name": "discord-guardian-bot",
+  "version": "1.0.0",
+  "description": "Discord Guardian Bot - Complete server protection and moderation bot with anti-nuke, anti-raid, and auto-moderation features",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "guardian",
+    "moderation",
+    "security",
+    "anti-nuke",
+    "anti-raid"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2"
+  }
+}

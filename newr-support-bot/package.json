@@ -1,0 +1,18 @@
+{
+  "name": "newr-support-bot",
+  "version": "1.0.0",
+  "description": "NEWROPLY Ultimate Support Bot - 999999+ Features | Developed by NEWR LABS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": ["discord", "bot", "support", "ticket", "moderation", "newroply", "newr-labs"],
+  "author": "NEWR LABS",
+  "license": "PROPRIETARY - NEWROPLY",
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2",
+    "sqlite3": "^6.0.1"
+  }
+}
