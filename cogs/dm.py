@@ -39,8 +39,15 @@ import db
 import smart
 from roles import DM_STAFF_ROLE_NAMES, dm_staff_roles, is_dm_staff
 
-NEWR_LABS_GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
-LOG_CHANNEL_ID = int(os.environ["LOG_CHANNEL_ID"]) if os.environ.get("LOG_CHANNEL_ID") else None
+def _env_int(name: str):
+    try:
+        return int(os.environ[name]) if os.environ.get(name) else None
+    except ValueError:
+        return None
+
+
+NEWR_LABS_GUILD_ID = _env_int("GUILD_ID")
+LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
 _DENIAL_COOLDOWN_SECONDS = 600  # one denial per user per burst
 
 STAFF_MENU = (
@@ -75,9 +82,12 @@ def _resolve_guild(bot: commands.Bot, fallback: discord.Guild | None = None) -> 
         guild = bot.get_guild(NEWR_LABS_GUILD_ID)
         if guild is not None:
             return guild
+        # Fail closed: never fall back to an arbitrary other server for
+        # a DM staff check when the target guild is not visible.
+        return fallback if fallback is not None and fallback.id == NEWR_LABS_GUILD_ID else None
     if fallback is not None:
         return fallback
-    return bot.guilds[0] if bot.guilds else None
+    return None
 
 
 async def _resolve_member(bot: commands.Bot, user_id: int,

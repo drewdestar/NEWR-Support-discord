@@ -54,9 +54,14 @@ class TicketPanelView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Open a Support Ticket", style=discord.ButtonStyle.primary, emoji="🎫")
+    @discord.ui.button(label="Open a Support Ticket", style=discord.ButtonStyle.primary, emoji="🎫", custom_id="newr_support_ticket_panel")
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await create_ticket_channel(interaction, "Opened from the ticket panel")
+        try:
+            channel = await create_ticket_channel(interaction, "Opened from the ticket panel")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"Could not create a ticket channel: {e}. Please ask staff for help.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
 
 
 async def create_ticket_channel(interaction: discord.Interaction, reason: str):
@@ -72,8 +77,14 @@ async def create_ticket_channel(interaction: discord.Interaction, reason: str):
     category = None
     cat_id = os.environ.get("SUPPORT_CATEGORY_ID")
     if cat_id:
-        category = guild.get_channel(int(cat_id))  # type: ignore[arg-type]
-    name = f"ticket-{user.name.lower().replace(' ', '-')}"[:90]
+        try:
+            category = guild.get_channel(int(cat_id))  # type: ignore[arg-type]
+        except ValueError:
+            category = None
+    # Discord channel names allow only lowercase letters, numbers, - and _.
+    import re as _re
+    safe = _re.sub(r"[^a-z0-9_-]", "-", user.name.lower()) or "user"
+    name = f"ticket-{safe}"[:90].rstrip("-") or "ticket-user"
     channel = await guild.create_text_channel(name, category=category, overwrites=overwrites,
                                               topic=f"Ticket for {user} | {reason}"[:200])
     db.add_row("tickets", guild_id=guild.id, channel_id=channel.id, owner_id=user.id,
@@ -102,7 +113,20 @@ class Support(commands.Cog):
     @app_commands.describe(reason="What do you need help with?")
     async def ticket_create(self, interaction: discord.Interaction, reason: str = "General support"):
         await interaction.response.defer(ephemeral=True)
-        channel = await create_ticket_channel(interaction, reason)
+        # Point to an existing open ticket instead of opening duplicates.
+        with db._conn() as conn:
+            existing = conn.execute(
+                "SELECT channel_id FROM tickets WHERE guild_id=? AND owner_id=? AND status IN ('open','claimed') ORDER BY id DESC LIMIT 1",
+                (interaction.guild.id, interaction.user.id)).fetchone()
+        if existing:
+            await interaction.followup.send(
+                f"You already have an open ticket: <#{existing['channel_id']}>. Please use that one instead of opening another.", ephemeral=True)
+            return
+        try:
+            channel = await create_ticket_channel(interaction, reason)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.followup.send(f"Could not create a ticket channel: {e}. Please ask staff for help.", ephemeral=True)
+            return
         # Smart triage (local, free): classify + route, posted in the ticket.
         try:
             await channel.send(smart.triage_text(reason))
@@ -124,8 +148,14 @@ class Support(commands.Cog):
         if interaction.user.id != row["owner_id"] and not staff_only(interaction):
             await interaction.response.send_message("Only the ticket owner or staff can close it.", ephemeral=True); return
         db.set_setting(interaction.guild.id, f"ticket_{row['channel_id']}", "closed")  # status marker
+        with db._conn() as conn:
+            conn.execute("UPDATE tickets SET status='closed' WHERE channel_id=?",
+                         (interaction.channel.id,))
         await interaction.response.send_message(f"Closing ticket. Reason: {reason}. Channel will be deleted in a moment.")
-        await interaction.channel.delete(reason=f"Ticket closed: {reason}")  # type: ignore[union-attr]
+        try:
+            await interaction.channel.delete(reason=f"Ticket closed: {reason}")  # type: ignore[union-attr]
+        except discord.HTTPException:
+            pass
 
     @app_commands.command(name="ticket_claim", description="Claim the current ticket as staff")
     async def ticket_claim(self, interaction: discord.Interaction):
@@ -196,6 +226,8 @@ class Support(commands.Cog):
         row = ticket_channel(interaction)
         if not row:
             await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True); return
+        if interaction.user.id != row["owner_id"] and not staff_only(interaction):
+            await interaction.response.send_message("Only the ticket owner or staff can escalate it.", ephemeral=True); return
         admins = [r.mention for r in interaction.guild.roles if r.permissions.administrator]
         await interaction.response.send_message(" ".join(admins) + " — this ticket has been escalated by "
                                 + interaction.user.mention)

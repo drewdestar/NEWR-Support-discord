@@ -45,7 +45,32 @@ except Exception:  # pragma: no cover - brain optional at runtime
     _brain = None
 
 COGS = ["cogs.support", "cogs.security", "cogs.moderation", "cogs.utility", "cogs.info", "cogs.dm"]
-GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
+try:
+    GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
+except ValueError:
+    GUILD_ID = None
+
+
+def _proxy_kwargs() -> dict:
+    """VM egress goes through an HTTP proxy; direct TLS to Discord fails
+    here (SSL WRONG_VERSION_NUMBER), while aiohttp with trust_env works.
+    discord.py does not read proxy env vars itself, so pass them explicitly.
+    Credentials stay in the environment, never in code or logs."""
+    from urllib.parse import unquote, urlparse
+
+    raw = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if not raw:
+        return {}
+    parsed = urlparse(raw)
+    proxy = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 3128}"
+    kwargs: dict = {"proxy": proxy}
+    if parsed.username:
+        import aiohttp
+
+        kwargs["proxy_auth"] = aiohttp.BasicAuth(
+            unquote(parsed.username),
+            unquote(parsed.password or ""))
+    return kwargs
 
 
 class SupportBot(commands.Bot):
@@ -57,7 +82,8 @@ class SupportBot(commands.Bot):
         intents.dm_messages = True  # needed for the staff-only DM gate
         intents.message_content = True  # privileged: needed for anti-spam/link and DM text
         intents.voice_states = True
-        super().__init__(command_prefix=None, intents=intents, help_command=None)
+        super().__init__(command_prefix=None, intents=intents, help_command=None,
+                         **_proxy_kwargs())
         self.started_at = datetime.now(timezone.utc)
 
     async def setup_hook(self) -> None:
@@ -75,6 +101,17 @@ class SupportBot(commands.Bot):
                 print(f"[brain] disabled: {e}")
         for cog in COGS:
             await self.load_extension(cog)
+        # Persistent views: without this, ticket/verify buttons posted
+        # before a restart become dead after restart. Both views use
+        # stable custom_ids, so re-registering them here revives old
+        # messages as well as new ones.
+        try:
+            from cogs.support import TicketPanelView
+            from cogs.security import VerifyView
+            self.add_view(TicketPanelView())
+            self.add_view(VerifyView())
+        except Exception as e:
+            print(f"[views] persistent view registration failed: {e}")
         self._brain_task = asyncio.create_task(self._brain_inbox_loop())
 
     async def _brain_inbox_loop(self) -> None:
@@ -119,6 +156,9 @@ class SupportBot(commands.Bot):
 
     async def on_ready(self) -> None:
         print(f"Logged in as {self.user} (id={self.user.id})")
+        if getattr(self, "_synced", False):
+            return
+        self._synced = True
         for guild in self.guilds:
             mapping = map_guild_roles(guild)
             summary = ", ".join(f"{k}:{len(v)}" for k, v in mapping.items() if v)

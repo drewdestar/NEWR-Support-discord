@@ -89,8 +89,15 @@ class Moderation(commands.Cog):
     async def unban(self, interaction: discord.Interaction, user_id: str, reason: str = "Unbanned"):
         if not staff_only(interaction):
             await interaction.response.send_message("Staff only.", ephemeral=True); return
-        user = await self.bot.fetch_user(int(user_id))
-        await interaction.guild.unban(user, reason=reason)
+        try:
+            uid = int(user_id.strip())
+        except ValueError:
+            await interaction.response.send_message("user_id must be a numeric Discord user ID.", ephemeral=True); return
+        try:
+            user = await self.bot.fetch_user(uid)
+            await interaction.guild.unban(user, reason=reason)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"Could not unban {uid}: {e}", ephemeral=True); return
         await interaction.response.send_message(f"{user.mention} unbanned.")
 
     @app_commands.command(name="ban_list", description="List banned users (staff)")
@@ -114,7 +121,23 @@ class Moderation(commands.Cog):
         if not staff_only(interaction) or not isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_message("Staff only, in a text channel.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
-        deleted = await interaction.channel.purge(limit=200, check=lambda m: m.author.id == member.id)
+        # Honour the requested amount: scan up to 5x that many recent
+        # messages (Discord purge limit is per-scan, not per-author), and
+        # stop once `amount` messages from this author are deleted.
+        target = max(1, min(200, amount))
+        deleted = []
+        try:
+            async for msg in interaction.channel.history(limit=target * 5):
+                if len(deleted) >= target:
+                    break
+                if msg.author.id == member.id:
+                    try:
+                        await msg.delete()
+                        deleted.append(msg)
+                    except discord.HTTPException:
+                        pass
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"Purge failed: {e}", ephemeral=True); return
         await interaction.followup.send(f"Deleted {len(deleted)} messages from {member.mention}.", ephemeral=True)
 
     @app_commands.command(name="set_nick", description="Set a member's nickname (staff)")

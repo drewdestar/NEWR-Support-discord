@@ -29,7 +29,7 @@ class VerifyView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Verify Me", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(label="Verify Me", style=discord.ButtonStyle.success, emoji="✅", custom_id="newr_support_verify")
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         guild = interaction.guild
         verified = [r for r in guild.roles if categorize_role(r, guild) == "verified"]
@@ -53,22 +53,30 @@ class Security(commands.Cog):
             return
         # Anti-link / anti-invite / banned words
         content = message.content
-        if db.get_setting(guild.id, "anti_link") == "on" and re.search(r"https?://", content):
-            await message.delete(); await message.channel.send(f"{author.mention} links are not allowed here.", delete_after=10); return
-        if db.get_setting(guild.id, "anti_invite") == "on" and "discord.gg/" in content:
-            await message.delete(); return
-        with db._conn() as conn:
-            words = [r["word"] for r in conn.execute("SELECT word FROM banned_words WHERE guild_id=?", (guild.id,))]
-        if any(w.lower() in content.lower() for w in words):
-            await message.delete(); return
+        try:
+            if db.get_setting(guild.id, "anti_link") == "on" and re.search(r"https?://", content):
+                await message.delete(); await message.channel.send(f"{author.mention} links are not allowed here.", delete_after=10); return
+            if db.get_setting(guild.id, "anti_invite") == "on" and "discord.gg/" in content:
+                await message.delete(); return
+            with db._conn() as conn:
+                words = [r["word"] for r in conn.execute("SELECT word FROM banned_words WHERE guild_id=?", (guild.id,)) if r["word"].strip()]
+            # Word-boundary matching: a banned substring inside an innocent
+            # word must not trigger deletion.
+            if any(re.search(rf"\b{re.escape(w.lower())}\b", content.lower()) for w in words):
+                await message.delete(); return
+        except discord.HTTPException:
+            return
         # Anti-spam: >5 messages in 10s
         if db.get_setting(guild.id, "anti_spam") == "on":
             now = time.time()
             times = [t for t in self._msg_times[author.id] if now - t < 10]
             times.append(now); self._msg_times[author.id] = times
             if len(times) > 5:
-                await message.delete()
-                await message.channel.send(f"{author.mention} slow down, you are sending messages too fast.", delete_after=10)
+                try:
+                    await message.delete()
+                    await message.channel.send(f"{author.mention} slow down, you are sending messages too fast.", delete_after=10)
+                except discord.HTTPException:
+                    pass
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
@@ -217,25 +225,34 @@ class Security(commands.Cog):
         if not staff_only(interaction):
             await interaction.response.send_message("Staff only.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
+        failed = 0
         for ch in interaction.guild.text_channels:
-            await ch.set_permissions(interaction.guild.default_role, send_messages=False)
-        await interaction.followup.send("🔒 Server locked.", ephemeral=True)
+            try:
+                await ch.set_permissions(interaction.guild.default_role, send_messages=False)
+            except discord.HTTPException:
+                failed += 1
+        await interaction.followup.send(f"🔒 Server locked." + (f" ({failed} channel(s) failed — check bot permissions.)" if failed else ""), ephemeral=True)
 
     @app_commands.command(name="unlock_server", description="Unlock all text channels (staff)")
     async def unlock_server(self, interaction: discord.Interaction):
         if not staff_only(interaction):
             await interaction.response.send_message("Staff only.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
+        failed = 0
         for ch in interaction.guild.text_channels:
-            await ch.set_permissions(interaction.guild.default_role, send_messages=None)
-        await interaction.followup.send("🔓 Server unlocked.", ephemeral=True)
+            try:
+                await ch.set_permissions(interaction.guild.default_role, send_messages=None)
+            except discord.HTTPException:
+                failed += 1
+        await interaction.followup.send(f"🔓 Server unlocked." + (f" ({failed} channel(s) failed — check bot permissions.)" if failed else ""), ephemeral=True)
 
     @app_commands.command(name="slowmode", description="Set slowmode in seconds for the current channel (staff)")
     async def slowmode(self, interaction: discord.Interaction, seconds: int):
         if not staff_only(interaction) or not isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_message("Staff only, in a text channel.", ephemeral=True); return
-        await interaction.channel.edit(slowmode_delay=max(0, min(21600, seconds)))
-        await interaction.response.send_message(f"Slowmode set to {seconds} seconds.")
+        clamped = max(0, min(21600, seconds))
+        await interaction.channel.edit(slowmode_delay=clamped)
+        await interaction.response.send_message(f"Slowmode set to {clamped} seconds.")
 
     # Quarantine / trusted / watchlist / banned words
     @app_commands.command(name="quarantine", description="Quarantine a member with the muted role (staff)")
@@ -303,6 +320,8 @@ class Security(commands.Cog):
     async def ban_word_add(self, interaction: discord.Interaction, word: str):
         if not staff_only(interaction):
             await interaction.response.send_message("Staff only.", ephemeral=True); return
+        if not word.strip():
+            await interaction.response.send_message("Banned word cannot be empty (an empty word would match everything).", ephemeral=True); return
         with db._conn() as conn:
             conn.execute("INSERT OR IGNORE INTO banned_words VALUES (?, ?)", (interaction.guild.id, word.lower()))
         await interaction.response.send_message(f"Banned word added: {word}")
