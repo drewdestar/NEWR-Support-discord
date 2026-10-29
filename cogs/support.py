@@ -10,10 +10,36 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+import smart
 from roles import is_staff, support_roles
 
 EMBED_COLOR = 0x5865F2
 
+
+
+def _brain_note(interaction: discord.Interaction, kind: str, summary: str) -> None:
+    """Record a Support event in the shared brain and notify NEWR AI.
+
+    Best-effort only: a brain failure must never break a command.
+    Never called with DM content (these are guild slash commands), and
+    summaries are truncated; memory.py also redacts credential-like text.
+    """
+    try:
+        import memory as brain
+        user = interaction.user
+        guild = interaction.guild
+        roles = [r.name for r in getattr(user, "roles", [])] if guild else []
+        brain.remember_user(str(user.id), str(guild.id) if guild else None,
+                            getattr(user, "display_name", None) or str(user),
+                            roles, source_bot="newr-support")
+        brain.remember_event(str(guild.id) if guild else None, kind,
+                             user_id=str(user.id), details=summary[:500],
+                             source_bot="newr-support")
+        brain.send_bot_message("newr-support", "newr-ai", "ticket_update",
+                               summary[:500], user_id=str(user.id),
+                               guild_id=str(guild.id) if guild else None)
+    except Exception:
+        pass
 
 def emb(title: str, desc: str) -> discord.Embed:
     return discord.Embed(title=title, description=desc, color=EMBED_COLOR,
@@ -52,6 +78,8 @@ async def create_ticket_channel(interaction: discord.Interaction, reason: str):
                                               topic=f"Ticket for {user} | {reason}"[:200])
     db.add_row("tickets", guild_id=guild.id, channel_id=channel.id, owner_id=user.id,
                status="open", reason=reason, claimed_by=None, created_at=db.now())
+    _brain_note(interaction, "ticket_opened",
+                f"Ticket opened in #{channel.name}: {reason}")
     await channel.send(f"{user.mention} Welcome! Support staff have been pinged. Reason: {reason}")
     return channel
 
@@ -75,7 +103,12 @@ class Support(commands.Cog):
     async def ticket_create(self, interaction: discord.Interaction, reason: str = "General support"):
         await interaction.response.defer(ephemeral=True)
         channel = await create_ticket_channel(interaction, reason)
-        await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+        # Smart triage (local, free): classify + route, posted in the ticket.
+        try:
+            await channel.send(smart.triage_text(reason))
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(f"Ticket created: {channel.mention}\n{smart.triage_text(reason)}", ephemeral=True)
 
     @app_commands.command(name="ticket_panel", description="Post a ticket panel with an open-ticket button")
     async def ticket_panel(self, interaction: discord.Interaction):
@@ -176,14 +209,28 @@ class Support(commands.Cog):
                                                 ephemeral=True)
 
     # ---- FAQ / helpdesk ----
-    @app_commands.command(name="faq", description="Look up a FAQ topic")
+    @app_commands.command(name="faq", description="Look up a FAQ topic (smart fuzzy match)")
     async def faq(self, interaction: discord.Interaction, topic: str):
         with db._conn() as conn:
             row = conn.execute("SELECT * FROM faqs WHERE guild_id IN (0, ?) AND topic=?",
                                (interaction.guild.id, topic.lower())).fetchone()
-        if not row:
-            await interaction.response.send_message(f"No FAQ for '{topic}'. Try /faq_list.", ephemeral=True); return
-        await interaction.response.send_message(embed=emb(f"FAQ: {topic}", row["answer"]), ephemeral=True)
+            if row:
+                await interaction.response.send_message(embed=emb(f"FAQ: {topic}", row["answer"]), ephemeral=True); return
+            # Smart fuzzy match: no exact topic? Suggest the closest answer.
+            rows = conn.execute("SELECT topic, answer FROM faqs WHERE guild_id IN (0, ?)",
+                                (interaction.guild.id,)).fetchall()
+        faqs = [{"topic": r["topic"], "answer": r["answer"]} for r in rows]
+        best, score, related = smart.fuzzy_faq(topic, faqs)
+        if best and score >= 0.30:
+            rel = ", ".join(r["topic"] for r in related) or "none"
+            await interaction.response.send_message(
+                embed=emb(f"FAQ (closest match: {best['topic']}, {score:.0%} match)",
+                          f"{best['answer']}\n\nRelated topics: {rel}\n\n💡 Tip of the day ({smart.daily_tip()['category']}): {smart.daily_tip()['text']}"),
+                ephemeral=True); return
+        tip = smart.daily_tip()
+        await interaction.response.send_message(
+            f"No close FAQ for '{topic}'. Try /faq_list.\n\n💡 Tip of the day ({tip['category']}): {tip['text']}",
+            ephemeral=True)
 
     @app_commands.command(name="faq_add", description="Add a FAQ entry (staff)")
     async def faq_add(self, interaction: discord.Interaction, topic: str, answer: str):
@@ -210,24 +257,28 @@ class Support(commands.Cog):
             conn.execute("DELETE FROM faqs WHERE guild_id=? AND topic=?", (interaction.guild.id, topic.lower()))
         await interaction.response.send_message(f"FAQ '{topic}' removed.")
 
-    @app_commands.command(name="helpdesk", description="Show how to get help on this server")
+    @app_commands.command(name="helpdesk", description="Show how to get help on this server (with today's smart tip)")
     async def helpdesk(self, interaction: discord.Interaction):
+        tip = smart.daily_tip()
         await interaction.response.send_message(embed=emb(
-            "Helpdesk", "1. Use /ticket_create for private help.\n2. Use /faq for common questions.\n"
-            "3. Use /report to report a problem user.\n4. Use /staff_ping only for urgent issues."),
+            "Helpdesk", "1. Use /ticket_create for private help.\n2. Use /faq for common questions (it fuzzy-matches, so exact wording is not needed).\n"
+            "3. Use /report to report a problem user.\n4. Use /staff_ping only for urgent issues.\n\n"
+            f"💡 Tip of the day ({tip['category']}): {tip['text']}"),
             ephemeral=True)
 
     @app_commands.command(name="staff_ping", description="Ping support staff for an urgent issue")
     async def staff_ping(self, interaction: discord.Interaction, issue: str):
         mentions = " ".join(r.mention for r in support_roles(interaction.guild)) or "staff"
-        await interaction.response.send_message(f"{mentions} Urgent help requested by {interaction.user.mention}: {issue}")
+        await interaction.response.send_message(f"{mentions} Urgent help requested by {interaction.user.mention}: {issue}\n{smart.triage_text(issue)}")
 
     # ---- reports / suggestions / bugs / appeals / feedback ----
     @app_commands.command(name="report", description="Report a member to staff")
     async def report(self, interaction: discord.Interaction, member: discord.Member, reason: str):
         rid = db.add_row("reports", guild_id=interaction.guild.id, reporter_id=interaction.user.id,
                          target_id=member.id, reason=reason, created_at=db.now())
-        await interaction.response.send_message(f"Report #{rid} filed against {member.mention}. Staff will review it.", ephemeral=True)
+        _brain_note(interaction, "report_filed",
+                    f"Report #{rid} against user {member.id}: {reason}")
+        await interaction.response.send_message(f"Report #{rid} filed against {member.mention}. Staff will review it.\n{smart.triage_text(reason)}", ephemeral=True)
 
     @app_commands.command(name="report_list", description="List recent reports (staff)")
     async def report_list(self, interaction: discord.Interaction):
@@ -241,7 +292,7 @@ class Support(commands.Cog):
     async def suggest(self, interaction: discord.Interaction, suggestion: str):
         sid = db.add_row("suggestions", guild_id=interaction.guild.id, author_id=interaction.user.id,
                          text=suggestion, created_at=db.now())
-        await interaction.response.send_message(f"Suggestion #{sid} recorded. Thanks!", ephemeral=True)
+        await interaction.response.send_message(f"Suggestion #{sid} recorded. Thanks!\n{smart.triage_text(suggestion)}", ephemeral=True)
 
     @app_commands.command(name="suggestion_list", description="List recent suggestions")
     async def suggestion_list(self, interaction: discord.Interaction):
@@ -253,7 +304,9 @@ class Support(commands.Cog):
     async def bug(self, interaction: discord.Interaction, description: str):
         bid = db.add_row("bugs", guild_id=interaction.guild.id, author_id=interaction.user.id,
                          text=description, created_at=db.now())
-        await interaction.response.send_message(f"Bug #{bid} recorded. Thanks for reporting it.", ephemeral=True)
+        _brain_note(interaction, "bug_filed",
+                    f"Bug #{bid}: {description}")
+        await interaction.response.send_message(f"Bug #{bid} recorded. Thanks for reporting it.\n{smart.triage_text(description)}", ephemeral=True)
 
     @app_commands.command(name="bug_list", description="List recent bug reports (staff)")
     async def bug_list(self, interaction: discord.Interaction):
@@ -267,7 +320,9 @@ class Support(commands.Cog):
     async def appeal(self, interaction: discord.Interaction, explanation: str):
         aid = db.add_row("appeals", guild_id=interaction.guild.id, author_id=interaction.user.id,
                          text=explanation, created_at=db.now())
-        await interaction.response.send_message(f"Appeal #{aid} filed. Staff will review it.", ephemeral=True)
+        _brain_note(interaction, "appeal_filed",
+                    f"Appeal #{aid}: {explanation}")
+        await interaction.response.send_message(f"Appeal #{aid} filed. Staff will review it.\n{smart.triage_text(explanation)}", ephemeral=True)
 
     @app_commands.command(name="appeal_list", description="List appeals (staff)")
     async def appeal_list(self, interaction: discord.Interaction):

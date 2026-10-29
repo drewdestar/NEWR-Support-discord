@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
 from discord.ext import commands
@@ -22,8 +23,26 @@ except Exception:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Shared brain: ONE memory.db for both bots. The module lives in
+# ../shared-brain/ next to this bot directory (and in the VM at
+# ~/workspace/bots/shared-brain/). If it cannot be found, the bot
+# still runs; brain features are simply disabled, never fatal.
+_BRAIN_DIRS = [
+    Path(__file__).resolve().parent.parent / "shared-brain",
+    Path.home() / "workspace" / "bots" / "shared-brain",
+]
+for _d in _BRAIN_DIRS:
+    if (_d / "memory.py").exists():
+        sys.path.insert(0, str(_d))
+        break
+
 import db  # noqa: E402
 from roles import map_guild_roles  # noqa: E402
+
+try:
+    import memory as _brain  # noqa: E402
+except Exception:  # pragma: no cover - brain optional at runtime
+    _brain = None
 
 COGS = ["cogs.support", "cogs.security", "cogs.moderation", "cogs.utility", "cogs.info", "cogs.dm"]
 GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
@@ -43,8 +62,60 @@ class SupportBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         db.init_db()
+        self.shared_brain_path = None
+        self.brain_available = False
+        if _brain is not None:
+            try:
+                raw = os.environ.get("SHARED_BRAIN_DB") or None
+                self.shared_brain_path = _brain.init_memory(
+                    os.path.expanduser(os.path.expandvars(raw)) if raw else None)
+                self.brain_available = True
+                print(f"[brain] shared memory: {self.shared_brain_path}")
+            except Exception as e:
+                print(f"[brain] disabled: {e}")
         for cog in COGS:
             await self.load_extension(cog)
+        self._brain_task = asyncio.create_task(self._brain_inbox_loop())
+
+    async def _brain_inbox_loop(self) -> None:
+        """Poll the shared brain every 45s for messages to newr-support.
+
+        Each message is handled exactly once and marked done in a
+        finally block (poison messages must not loop forever). This
+        bot NEVER replies to a bot_message with a new bot_message of
+        the same kind, so Support <-> AI cannot ping-pong.
+        """
+        await self.wait_until_ready()
+        while not self.is_closed():
+            if self.brain_available and _brain is not None:
+                try:
+                    for msg in _brain.fetch_bot_messages("newr-support"):
+                        try:
+                            if msg.get("kind") == "ai_summary":
+                                _brain.remember_event(
+                                    msg.get("guild_id"), "ai_summary_received",
+                                    user_id=msg.get("user_id"),
+                                    details=(msg.get("text") or "")[:500],
+                                    source_bot="newr-support")
+                            log_id = os.environ.get("LOG_CHANNEL_ID")
+                            if log_id:
+                                ch = self.get_channel(int(log_id))
+                                if ch is not None:
+                                    await ch.send(
+                                        f"[brain] from {msg.get('from_bot')}: "
+                                        f"{msg.get('kind')} (user {msg.get('user_id')})")
+                            print(f"[brain] inbox {msg.get('from_bot')} -> "
+                                  f"newr-support kind={msg.get('kind')} id={msg.get('id')}")
+                        except Exception as e:
+                            print(f"[brain] inbox handling failed: {e}")
+                        finally:
+                            try:
+                                _brain.mark_bot_message_done(msg["id"])
+                            except Exception:
+                                pass
+                except Exception as e:
+                    print(f"[brain] inbox poll failed: {e}")
+            await asyncio.sleep(45)
 
     async def on_ready(self) -> None:
         print(f"Logged in as {self.user} (id={self.user.id})")

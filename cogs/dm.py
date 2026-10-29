@@ -36,6 +36,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+import smart
 from roles import DM_STAFF_ROLE_NAMES, dm_staff_roles, is_dm_staff
 
 NEWR_LABS_GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
@@ -123,7 +124,14 @@ class DMGate(commands.Cog):
         # Staff / top roles only, from here on.
         text = (message.content or "").strip()
         if not text or text.lower() in ("menu", "help", "halo", "hi", "hello"):
-            await message.channel.send(STAFF_MENU)
+            tip = smart.daily_tip()
+            await message.channel.send(STAFF_MENU + f"\n\n💡 Tip of the day ({tip['category']}): {tip['text']}")
+            return
+        # Staff-only smart tip in DM (on_message): "tip"/"tips" returns the
+        # rotating local tip instead of being stored as a support request.
+        if text.lower() in ("tip", "tips", "tips please", "smart tip"):
+            tip = smart.daily_tip()
+            await message.channel.send(f"💡 Tip of the day ({tip['category']}): {tip['text']}")
             return
         # Staff DM support request: store it, forward a summary to the
         # log channel when configured, confirm with the request ID.
@@ -142,6 +150,7 @@ class DMGate(commands.Cog):
                     pass
         await message.channel.send(
             f"✅ Support request DM kamu tersimpan sebagai **#{request_id}**.\n"
+            f"{smart.triage_text(text)}\n"
             f"Staff bisa menindaklanjuti dari log channel, atau kamu bisa buat tiket penuh "
             f"di server dengan `/ticket_create`. Kirim pesan lagi di DM ini untuk request baru, "
             f"atau ketik `menu` untuk menu staff.")

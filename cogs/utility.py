@@ -7,6 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import smart
 from roles import (CATEGORIES, categorize_role, highest_category,
                    map_guild_roles, ping_roles)
 
@@ -117,8 +118,11 @@ class Utility(commands.Cog):
     async def help_cmd(self, interaction: discord.Interaction):
         mapping = map_guild_roles(interaction.guild)
         summary = ", ".join(f"{k}: {len(v)}" for k, v in mapping.items() if v)
-        await interaction.response.send_message(embed=emb("NEWR Support Help", "Use /ticket_create for help, /faq for answers, /verify to verify.\n"
-                f"Role categories on this server: {summary}\nFull command list: /command_list"), ephemeral=True)
+        tip = smart.daily_tip()
+        await interaction.response.send_message(embed=emb("NEWR Support Help", "Use /ticket_create for help, /faq for answers (it fuzzy-matches, so exact wording is not needed), /verify to verify.\n"
+                f"Role categories on this server: {summary}\nFull command list: /command_list\n\n"
+                f"💡 Smart tip of the day ({tip['category']}): {tip['text']}\n"
+                "Tip categories: security, scam, support, safety, newr — the tip rotates daily, free and local, no AI key needed."), ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

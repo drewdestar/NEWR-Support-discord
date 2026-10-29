@@ -66,6 +66,16 @@ role = ping (see `/pingroles`).
 member count, and mapped category — so in NEWR LABS it lists all
 38 roles. `/rolecheck @member` checks one member against the mapping.
 
+
+## Smart layer (free, local — no AI key needed)
+
+New in `smart.py`, with no new slash command (total stays at 100):
+
+- **Rotating tips:** `/help` and `/helpdesk` now show a tip of the day, rotating by calendar day across security, scam/phishing, support etiquette, server safety, and NEWR LABS tips. Staff can also type `tip` in a DM to the bot for today's tip.
+- **Smart FAQ matching:** `/faq` no longer needs an exact topic. It fuzzy-matches (topic-weighted, stopwords ignored, so "how do I get verified?" finds the `verify` FAQ) and, on a close match, shows the closest answer plus related topics. Below a 0.30 match it says so honestly and shows the tip of the day instead of guessing.
+- **Smart ticket triage:** `/ticket_create`, `/report`, `/bug`, `/suggest`, `/appeal`, and `/staff_ping` now classify the text locally into account / scam / harassment / moderation / technical / suggestion / general, with a priority (high/medium/low) and the staff category that should handle it (support vs moderator, using the roles.py mapping). The triage is posted in the ticket and in the confirmation — it is a rule-based suggestion, not an AI verdict.
+- **Optional AI:** if an OpenAI-compatible AI key is ever configured for this bot in future, it may be used for smarter replies, but the local layer above works with no key and never fakes an AI answer or claims a paid model ran.
+
 ## Setup
 
 1. Python 3.11+ and a Discord application with a bot user.
@@ -128,3 +138,20 @@ Tickets, warnings, settings, reports, suggestions, bugs, appeals,
 feedback, watchlists, banned words, and FAQs are stored in a local
 SQLite file (`data.db` by default, or `DB_PATH` if set). No token,
 secret, or password is stored in code, in the database, or in docs.
+
+## Shared brain (one brain, two bots)
+
+Both bots read and write the SAME SQLite file:
+`~/workspace/bots/shared-brain/memory.db` (or `SHARED_BRAIN_DB` in
+`.env`, which must be the same path for both bots). What Support
+learns (tickets, reports, bugs, appeals) is visible to AI via
+`recall_cross_bot`, and what AI learns (chats, preferences) is
+visible to Support. The bots also talk to each other through the
+`bot_messages` queue in that database: Support sends `ticket_update`
+messages to AI, AI sends `ai_summary` messages to Support when a
+user asks for staff/ticket help. Each bot polls its own inbox every
+45 seconds, handles each message once, and marks it done in a
+finally block; a bot never replies to a bot_message with a new
+bot_message of the same kind, so the two bots cannot loop forever.
+No passwords, tokens, or API keys are ever stored in the brain, and
+`forget_user` deletes a user's rows across both bots.

@@ -1,0 +1,8 @@
+# Secrets and local runtime files — never commit these.
+.env
+!.env.example
+logs/
+data.db
+*.log
+.venv/
+__pycache__/
