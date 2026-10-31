@@ -108,11 +108,18 @@ class VerifyImageModal(discord.ui.Modal, title="Human Check"):
                 await interaction.response.send_message(embed=err("Verification Failed", "No verified role found on this server."), ephemeral=True); return
             await interaction.response.send_message(embed=ok_embed("Verified!", "✅ Correct! You now have the Verified role and can access the server."), ephemeral=True)
         else:
-            # Row is NOT deleted on a wrong answer: the same captcha
-            # stays active, so the user retries the same image
-            # (via Enter Answer) instead of spamming Verify for a
-            # new, easier code.
-            await interaction.response.send_message(embed=err("Wrong Answer", "That code was wrong. Your current captcha is still active — try again with the same image (Enter Answer). Tip: if the modal hides the image on your phone, close it and use 'Answer in DM' on the captcha message instead — the image stays visible in your DM chat while you type. No role was given."), ephemeral=True)
+            # Wrong modal answer invalidates the code, so the user
+            # is not stuck retrying a misread image forever. The
+            # row is deleted, which also re-enables Verify (the
+            # anti-spam silent ignore only applies while a row is
+            # active), so clicking Verify again gives a NEW image.
+            # The old ephemeral message cannot be deleted by the
+            # bot, so it stays visible but its code is dead — the
+            # user must use the new message from Verify.
+            with db._conn() as conn:
+                conn.execute("DELETE FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                             (interaction.user.id, interaction.guild.id))
+            await interaction.response.send_message(embed=err("Wrong Answer", "That code was wrong and this captcha is now invalid. Click Verify again for a NEW image. Tip: if the modal hides the image on your phone, use 'Answer in DM' on the new captcha message instead — the image stays visible in your DM chat while you type. No role was given."), ephemeral=True)
 
 
 class VerifyAnswerView(discord.ui.View):
@@ -153,7 +160,7 @@ class VerifyAnswerView(discord.ui.View):
                 embed=err("Captcha Expired", "Click Verify again for a new image."), ephemeral=True); return
         try:
             dm_msg = await interaction.user.send(
-                embed=panel("🔒 Human Check", "Reply to this DM with the code from the image below. You can see the image above while you type. If your answer is wrong, this message is automatically deleted and a fresh copy of the same captcha is sent."),
+                embed=panel("🔒 Human Check", "Reply to this DM with the code from the image below. You can see the image above while you type. If your answer is wrong, this message is automatically deleted and a NEW captcha is sent."),
                 file=discord.File(_io.BytesIO(_make_captcha_image(row["code"])), filename="captcha.png"))
         except discord.HTTPException:
             await interaction.response.send_message(
@@ -185,6 +192,60 @@ class VerifyView(discord.ui.View):
         import io as _io
         from cogs.ui import err, panel
         from roles import categorize_role
+        # DM branch (user idea 2026-10-31 20:41 WIB): the same
+        # Verify button can be clicked in a DM (e.g. on the
+        # /verify_remind DM), so the user can verify right here
+        # without going back to #verification. In a DM there is
+        # no guild on the interaction, so find the guild where
+        # the user is a member, then send the image captcha as a
+        # DM message and let the existing DM reply handler
+        # (verify_captchas with dm_message_id) check the answer
+        # — replying in DM keeps the image visible while typing.
+        if interaction.guild is None:
+            client = interaction.client
+            target_guild = None
+            target_member = None
+            for g in getattr(client, "guilds", []):
+                m = g.get_member(interaction.user.id)
+                if m is not None:
+                    target_guild, target_member = g, m
+                    break
+            if target_guild is None:
+                await interaction.response.send_message(
+                    "You are not in NEWR LABS (anymore). Join the server first, then verify in #verification."); return
+            verified_roles = [r for r in target_guild.roles if categorize_role(r, target_guild) == "verified"]
+            if verified_roles and any(r in target_member.roles for r in verified_roles):
+                await interaction.response.send_message("✅ You already have the Verified role — no captcha needed."); return
+            with db._conn() as conn:
+                existing_dm = conn.execute("SELECT code, created_at FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                                           (interaction.user.id, target_guild.id)).fetchone()
+            if existing_dm is not None:
+                try:
+                    _age = (datetime.now(timezone.utc) - datetime.fromisoformat(existing_dm["created_at"].replace("Z", "+00:00"))).total_seconds()
+                except Exception:
+                    _age = 999999
+                if _age < 600:
+                    await interaction.response.defer_update(); return
+                with db._conn() as conn:
+                    conn.execute("DELETE FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                                 (interaction.user.id, target_guild.id))
+            dm_code = _new_verify_code()
+            with db._conn() as conn:
+                conn.execute("INSERT INTO verify_captchas VALUES (?, ?, ?, ?, NULL)",
+                             (interaction.user.id, target_guild.id, dm_code, db.now()))
+            try:
+                dm_msg = await interaction.user.send(
+                    embed=panel("🔒 Human Check", "Reply to this DM with the code from the image below. You can see the image above while you type. If your answer is wrong, this message is automatically deleted and a NEW captcha is sent."),
+                    file=discord.File(_io.BytesIO(_make_captcha_image(dm_code)), filename="captcha.png"))
+                with db._conn() as conn:
+                    conn.execute("UPDATE verify_captchas SET dm_message_id=? WHERE user_id=? AND guild_id=?",
+                                 (dm_msg.id, interaction.user.id, target_guild.id))
+            except Exception:
+                with db._conn() as conn:
+                    conn.execute("DELETE FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                                 (interaction.user.id, target_guild.id))
+                await interaction.response.send_message("Could not send the captcha image. Please try again in #verification."); return
+            await interaction.response.defer_update(); return
         member = interaction.user  # type: ignore[attr-defined]
         verified = [r for r in interaction.guild.roles if categorize_role(r, interaction.guild) == "verified"]  # type: ignore[attr-defined]
         if verified and any(r in member.roles for r in verified):
@@ -416,19 +477,27 @@ class Security(commands.Cog):
                         await message.channel.send("✅ Correct! You are verified!" if vok else "No verified role found on this server.")
                         return
                     # Wrong: auto-delete the old DM captcha message,
-                    # then resend the SAME code as a fresh DM message
-                    # (no code refresh, so wrong answers cannot be
-                    # used to fish for an easier code).
+                    # then send a NEW captcha image with a NEW code.
+                    # The previous same-code behaviour made the image
+                    # look stuck ("itu itu mulu ga ganti", 2026-10-31
+                    # 21:04 WIB screenshot): a misread code could
+                    # never be escaped, because every wrong answer
+                    # resent the same letters. A new random code on
+                    # every wrong answer is standard captcha behaviour
+                    # and does not help brute force (each guess is
+                    # still 1 in ~33M, and the new code is only shown
+                    # after the wrong guess).
                     await _delete_dm_captcha()
                     import io as _io2
                     from cogs.ui import panel as _panel
+                    new_code = _new_verify_code()
                     try:
                         new_dm = await message.channel.send(
-                            embed=_panel("🔒 Human Check", "❌ Wrong code. The old captcha message was deleted. Reply to this DM with the code from the image below — you can see it above while you type."),
-                            file=discord.File(_io2.BytesIO(_make_captcha_image(vrow["code"])), filename="captcha.png"))
+                            embed=_panel("🔒 Human Check", "❌ Wrong code. The old captcha message was deleted. Here is a NEW captcha — reply to this DM with the code from the image below, you can see it above while you type."),
+                            file=discord.File(_io2.BytesIO(_make_captcha_image(new_code)), filename="captcha.png"))
                         with db._conn() as conn:
-                            conn.execute("UPDATE verify_captchas SET dm_message_id=? WHERE user_id=? AND guild_id=?",
-                                         (new_dm.id, message.author.id, vrow["guild_id"]))
+                            conn.execute("UPDATE verify_captchas SET code=?, created_at=?, dm_message_id=? WHERE user_id=? AND guild_id=?",
+                                         (new_code, db.now(), new_dm.id, message.author.id, vrow["guild_id"]))
                     except Exception:
                         await message.channel.send("❌ Wrong code. Click Verify in #verification to try again.")
                     return
@@ -682,6 +751,107 @@ class Security(commands.Cog):
         if unverified:
             await member.remove_roles(*unverified, reason="Manual verification")
         await interaction.response.send_message(f"{member.mention} has been verified.")
+
+    @app_commands.command(name="verify_remind", description="DM unverified members to verify (staff; one member, or all unverified if no member given)")
+    async def verify_remind(self, interaction: discord.Interaction, member: discord.Member | None = None):
+        """Staff reminder DM for unverified members.
+
+        Same text as the auto-DM on join: go to #verification,
+        click Verify Me, solve the captcha, get Verified. This
+        does NOT verify anyone directly — the captcha gate still
+        applies. Bulk mode (no member given) is capped by a
+        24-hour cooldown in the DB, so staff cannot spam all
+        unverified members by running it repeatedly; a single
+        member DM is always allowed.
+        """
+        if not staff_only(interaction):
+            await interaction.response.send_message(embed=_denied(), ephemeral=True); return
+        import asyncio as _asyncio
+        from cogs.ui import panel as _panel
+        guild = interaction.guild
+        verified = [r for r in guild.roles if categorize_role(r, guild) == "verified"]
+        unverified = [r for r in guild.roles if categorize_role(r, guild) == "unverified"]
+        verify_ch = None
+        for ch in guild.text_channels:
+            if "verif" in ch.name.lower():
+                verify_ch = ch
+                break
+        if verify_ch is None:
+            verify_ch = guild.get_channel(1471125629259878543)
+        verify_mention = verify_ch.mention if verify_ch is not None else "#✔️-verification"
+
+        def _dm_embed(target: discord.Member) -> discord.Embed:
+            return _panel(
+                "Verify to access NEWR LABS!",
+                f"Hi! {target.mention}, you are still Unverified in NEWR LABS, so you cannot "
+                f"access the server yet.\n\n"
+                f"To get access, go to {verify_mention} in NEWR LABS "
+                f"and click **Verify Me**, then solve the captcha. "
+                f"Once you verify, you will get the Verified role and "
+                f"can see the whole server.\n\n"
+                f"Or you can verify right here by clicking **Verify** "
+                f"below this message — the captcha image will be sent "
+                f"in this DM and you can reply with its code here.",
+                0x5865F2)
+
+        async def _dm_one(target: discord.Member) -> bool:
+            try:
+                await target.send(embed=_dm_embed(target), view=VerifyView())
+                return True
+            except Exception:
+                return False
+
+        if member is not None:
+            if verified and any(r in member.roles for r in verified):
+                await interaction.response.send_message(
+                    embed=_panel("Already Verified", f"{member.mention} already has the Verified role — no reminder sent."),
+                    ephemeral=True); return
+            if member.bot:
+                await interaction.response.send_message(
+                    embed=_panel("Not Sent", "Bot accounts do not need verification."), ephemeral=True); return
+            await interaction.response.defer(ephemeral=True)
+            ok = await _dm_one(member)
+            await interaction.followup.send(
+                f"Reminder DM {'sent to' if ok else 'could NOT be sent to (DMs closed?)'} {member.mention}.",
+                ephemeral=True); return
+
+        # Bulk mode: all human members with Unverified and without Verified.
+        targets = [m for m in guild.members
+                   if not m.bot and unverified and any(r in m.roles for r in unverified)
+                   and not (verified and any(r in m.roles for r in verified))]
+        if not targets:
+            await interaction.response.send_message(
+                embed=_panel("No Unverified Members", "Nobody currently has the Unverified role without Verified."),
+                ephemeral=True); return
+        last = db.get_setting(guild.id, "verify_remind_last", "")
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                age_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+                if age_h < 24:
+                    await interaction.response.send_message(
+                        embed=_panel("Bulk Reminder Cooldown",
+                                     f"A bulk reminder was already sent {age_h:.1f} hour(s) ago. "
+                                     f"Wait until 24 hours have passed, or DM a single member with "
+                                     f"/verify_remind member:<member> instead."),
+                        ephemeral=True); return
+            except Exception:
+                pass
+        await interaction.response.defer(ephemeral=True)
+        sent = failed = 0
+        for target in targets:
+            if await _dm_one(target):
+                sent += 1
+            else:
+                failed += 1
+            await _asyncio.sleep(0.5)
+        db.set_setting(guild.id, "verify_remind_last", db.now())
+        await interaction.followup.send(
+            f"Reminder DMs sent to {sent} unverified member(s); {failed} failed (DMs closed). "
+            f"Bulk reminders are on a 24-hour cooldown.",
+            ephemeral=True)
 
     # NOTE: /verify_word was retired with the unified verify flow:
     # hidden-word was a separate panel mode, and the user asked

@@ -59,19 +59,33 @@ ACTIONS: dict[str, tuple[str, str, int]] = {
 
 
 def user_tag(user) -> str:
-    """Clickable mention + readable account name, NOT a bare ID.
+    """Clickable mention + plain username + explicit ID, all three.
 
-    A raw <@id> mention sometimes renders in Discord as just the
-    ID number (client cannot resolve it), so staff cannot tell
-    who it is. Adding the account name as plain text next to
-    the mention guarantees the account is always visible, and
-    the mention itself stays tappable to open the profile.
+    History: v1 (mention + plain name) rendered the pill as a
+    raw ID on the user's client (2026-10-31 17:56 WIB screenshot);
+    v2 (plain @username only, 17:58 WIB) fixed the rendering but
+    the user then complained (20:19 WIB screenshot) that the ID
+    was gone and the username could not be tapped. v3 keeps all
+    three pieces as text, so no client rendering quirk can hide
+    any of them: the pill stays tappable to open the profile,
+    the username is readable as plain text even if the pill
+    renders as an ID, and the ID is readable as plain text too.
     """
     try:
         name = getattr(user, "name", None) or getattr(user, "display_name", None)
     except Exception:
         name = None
-    return f"{user.mention} (@{name})" if name else user.mention
+    try:
+        uid = user.id
+    except Exception:
+        uid = None
+    if name and uid is not None:
+        return f"{user.mention} (@{name} — ID {uid})"
+    if name:
+        return f"@{name}"
+    if uid is not None:
+        return f"ID {uid}"
+    return "Unknown"
 
 
 async def log_action(guild: discord.Guild, action: str,
@@ -83,8 +97,7 @@ async def log_action(guild: discord.Guild, action: str,
     if channel is None:
         return False
     emoji, label, colour = ACTIONS.get(action, ("📝", action, 0x5865F2))
-    # Mentions render as a clickable tag in Discord, so the log shows
-    # both the username (as a tag) and the numeric ID, like YAGPDB.
+    # Log tags are mention + @username + ID (see user_tag).
     mod_line = (user_tag(moderator) if moderator is not None else "System")
     desc = (f"{mod_line}\n\n"
             f"{emoji} **{label}** {user_tag(target)}\n"

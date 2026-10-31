@@ -125,6 +125,25 @@ class DMGate(commands.Cog):
                 (message.author.id,)).fetchone() is not None
         if in_application:
             return
+        # A DM captcha owns the DM while it is in progress, just
+        # like a DM application: a captcha answer must NOT also
+        # become a DM support request. Bug 2026-10-31 21:04 WIB:
+        # user typed "Yug" as a captcha answer and got BOTH a
+        # "Wrong code" DM captcha reply AND "DM support request
+        # saved as #9". Security's DM handler owns captcha
+        # replies, so DMGate must stay out while a verify DM
+        # captcha (dm_message_id set) or a join image captcha
+        # is active for this user.
+        with db._conn() as conn:
+            in_captcha = conn.execute(
+                "SELECT 1 FROM verify_captchas WHERE user_id=? AND dm_message_id IS NOT NULL LIMIT 1",
+                (message.author.id,)).fetchone() is not None
+            if not in_captcha:
+                in_captcha = conn.execute(
+                    "SELECT 1 FROM image_captchas WHERE user_id=? LIMIT 1",
+                    (message.author.id,)).fetchone() is not None
+        if in_captcha:
+            return
         user = message.author
         guild, member = await _resolve_member(self.bot, user.id)
         if guild is None:
