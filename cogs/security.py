@@ -184,6 +184,14 @@ class VerifyView(discord.ui.View):
     separate verify panel and no separate captcha panel: verify IS
     the captcha, in a single flow.
     """
+    # Anti-spam for the already-verified notice (user report
+    # 2026-10-31 22:25 WIB: after verifying, spamming Verify
+    # made the bot spam "You already have the Verified role"
+    # once per click in DM). First notice per user is sent,
+    # repeats within 10 minutes are silently acknowledged,
+    # so the notice appears 1x, not once per click.
+    _already_notice: dict[int, float] = {}
+
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
@@ -215,6 +223,10 @@ class VerifyView(discord.ui.View):
                     "You are not in NEWR LABS (anymore). Join the server first, then verify in #verification."); return
             verified_roles = [r for r in target_guild.roles if categorize_role(r, target_guild) == "verified"]
             if verified_roles and any(r in target_member.roles for r in verified_roles):
+                _now = time.time()
+                if _now - VerifyView._already_notice.get(interaction.user.id, 0) < 600:
+                    await interaction.response.defer_update(); return
+                VerifyView._already_notice[interaction.user.id] = _now
                 await interaction.response.send_message("✅ You already have the Verified role — no captcha needed."); return
             with db._conn() as conn:
                 existing_dm = conn.execute("SELECT code, created_at FROM verify_captchas WHERE user_id=? AND guild_id=?",
@@ -249,6 +261,10 @@ class VerifyView(discord.ui.View):
         member = interaction.user  # type: ignore[attr-defined]
         verified = [r for r in interaction.guild.roles if categorize_role(r, interaction.guild) == "verified"]  # type: ignore[attr-defined]
         if verified and any(r in member.roles for r in verified):
+            _now = time.time()
+            if _now - VerifyView._already_notice.get(member.id, 0) < 600:
+                await interaction.response.defer_update(); return
+            VerifyView._already_notice[member.id] = _now
             await interaction.response.send_message(
                 embed=panel("✅ Already Verified", "You already have the Verified role — no captcha needed."),
                 ephemeral=True); return
@@ -840,13 +856,28 @@ class Security(commands.Cog):
             except Exception:
                 pass
         await interaction.response.defer(ephemeral=True)
-        sent = failed = 0
-        for target in targets:
-            if await _dm_one(target):
-                sent += 1
-            else:
-                failed += 1
-            await _asyncio.sleep(0.5)
+        # Why bulk felt laggy (user report 2026-10-31 21:56 WIB):
+        # the old loop sent 80 DMs one by one with a 0.5s sleep
+        # each, plus a DM-channel creation per user, so the staff
+        # saw nothing until the final summary ~1-2 minutes later,
+        # while a single DM is instant. Fix: tell staff immediately
+        # that the blast started, then send with a small
+        # concurrency (3 at a time, discord.py still rate-limits
+        # and retries on 429), so the total time drops and the
+        # staff is not left staring at a spinning interaction.
+        await interaction.followup.send(
+            f"Sending reminder DMs to {len(targets)} unverified member(s)… "
+            f"this takes a while, I will report the final count here when done.",
+            ephemeral=True)
+        semaphore = _asyncio.Semaphore(3)
+
+        async def _dm_guarded(target: discord.Member) -> bool:
+            async with semaphore:
+                return await _dm_one(target)
+
+        results = await _asyncio.gather(*[_dm_guarded(t) for t in targets])
+        sent = sum(1 for r in results if r)
+        failed = len(results) - sent
         db.set_setting(guild.id, "verify_remind_last", db.now())
         await interaction.followup.send(
             f"Reminder DMs sent to {sent} unverified member(s); {failed} failed (DMs closed). "
