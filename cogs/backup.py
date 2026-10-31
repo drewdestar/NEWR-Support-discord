@@ -195,8 +195,13 @@ def _load_backup(backup_id: str) -> tuple[Path | None, dict | None]:
     return None, None
 
 
-def _prune(guild_id: int, keep: int = 10) -> None:
-    """Keep only the newest `keep` backups for one guild."""
+def _prune(guild_id: int, keep: int = 30) -> None:
+    """Keep only the newest `keep` backups for one guild.
+
+    Retention raised 2026-10-31 22:32 WIB (user request):
+    10 -> 30 backups, so older snapshots survive bot restarts
+    and hourly auto-backups instead of being pruned away.
+    """
     files = [p for p in _list_backups()
              if p.name.startswith(f"{guild_id}_")]
     for old in files[keep:]:
@@ -488,8 +493,40 @@ class BackupGroup(commands.GroupCog, group_name="backup",
                              f"{len(d.get('text_channels', [])) + len(d.get('voice_channels', []))} channels")
             except Exception:
                 lines.append(f"`{p.stem}` — unreadable")
+        total = len(_list_backups())
         await interaction.response.send_message(
-            "📦 **Backups (newest first):**\n" + "\n".join(lines), ephemeral=True)
+            f"📦 **Backups (newest 10 of {total} kept, max 30):**\n" + "\n".join(lines)
+            + "\nDownload one with `/backup download` (empty = newest).", ephemeral=True)
+
+    @app_commands.command(name="download", description="Download a backup file (staff; latest if no ID given)")
+    @app_commands.describe(backup_id="Backup ID from /backup list (filename without .json); leave empty for the newest backup")
+    async def download(self, interaction: discord.Interaction, backup_id: str = ""):
+        if not _staff_only(interaction):
+            await interaction.response.send_message(embed=_denied(), ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        if backup_id.strip():
+            path, data = _load_backup(backup_id.strip())
+            if data is None:
+                await interaction.followup.send(
+                    f"Backup `{backup_id}` not found. Check /backup list.", ephemeral=True); return
+        else:
+            files = [p for p in _list_backups()
+                     if p.name.startswith(f"{interaction.guild.id}_")]
+            if not files:
+                await interaction.followup.send("No backups yet. Use /backup create.", ephemeral=True); return
+            path = files[0]
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                data = None
+        total = len([p for p in _list_backups()
+                     if p.name.startswith(f"{interaction.guild.id}_")])
+        await interaction.followup.send(
+            f"📦 Backup `{path.stem}`"
+            + (f" — {data.get('guild_name', '?')} at {str(data.get('created_at', '?'))[:19]}" if data else "")
+            + f" — {total} backup(s) kept (max 30).",
+            file=discord.File(str(path), filename=path.name),
+            ephemeral=True)
 
     @app_commands.command(name="restore", description="Restore a backup into THIS server (owner only)")
     @app_commands.describe(backup_id="Backup ID from /backup list (the filename without .json)",
