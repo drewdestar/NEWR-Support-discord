@@ -8,50 +8,100 @@ from discord import app_commands
 from discord.ext import commands
 
 import smart
+from cogs.ui import denied as _denied, err as _err, make as _make, ok as _ok
 from roles import (CATEGORIES, categorize_role, highest_category,
-                   map_guild_roles, ping_roles)
+                   is_staff, map_guild_roles, ping_roles)
 
 
 def emb(title: str, desc: str) -> discord.Embed:
-    return discord.Embed(title=title, description=desc, color=0x57F287,
-                         timestamp=datetime.now(timezone.utc))
+    from cogs.ui import panel
+    return panel(title, desc, 0x57F287)
 
 
 class Utility(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    @app_commands.command(name="say", description="Send a message as the bot to a channel, with mentions (staff)")
+    @app_commands.describe(
+        message="Message text. Mentions typed here (@everyone, @role, #channel) are sent as-is and will ping/link if valid.",
+        channel="Target text channel (default: the channel you run this in)",
+        category="Target category: send the message to every text channel in it",
+        ping_user="Also mention this user at the start of the message",
+        ping_role="Also mention this role at the start of the message",
+        ping_everyone="Also mention @everyone at the start of the message")
+    async def say(self, interaction: discord.Interaction, message: str,
+                  channel: discord.TextChannel | None = None,
+                  category: discord.CategoryChannel | None = None,
+                  ping_user: discord.User | None = None,
+                  ping_role: discord.Role | None = None,
+                  ping_everyone: bool = False):
+        if not is_staff(interaction.user):  # type: ignore[arg-type]
+            await interaction.response.send_message(embed=_denied(), ephemeral=True); return
+        parts: list[str] = []
+        if ping_everyone:
+            parts.append("@everyone")
+        if ping_role is not None:
+            parts.append(ping_role.mention)
+        if ping_user is not None:
+            parts.append(ping_user.mention)
+        if message:
+            parts.append(message)
+        content = " ".join(parts).strip()
+        if not content:
+            await interaction.response.send_message("Nothing to send.", ephemeral=True); return
+        if category is not None:
+            targets = sorted(category.text_channels, key=lambda c: c.position)
+        elif channel is not None:
+            targets = [channel]
+        elif isinstance(interaction.channel, discord.TextChannel):
+            targets = [interaction.channel]
+        else:
+            await interaction.response.send_message(
+                "Pick a channel or category to send to.", ephemeral=True); return
+        if not targets:
+            await interaction.response.send_message(
+                "That category has no text channels.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        # Discord's per-message limit is 2000 characters; split long
+        # messages so a long announcement does not fail outright.
+        chunks = [content[i:i + 2000] for i in range(0, len(content), 2000)]
+        sent, failed = [], []
+        for target in targets:
+            try:
+                for chunk in chunks:
+                    await target.send(chunk)
+                sent.append(target.mention)
+            except Exception as e:
+                failed.append(f"{target.mention} ({e})")
+        note = ""
+        if category is not None:
+            note = "\nNote: Discord has no category mention, so a category target means the message was sent to every text channel in that category."
+        await interaction.followup.send(
+            f"✅ Sent to: {', '.join(sent) or 'none'}"
+            + (f"\n❌ Failed: {', '.join(failed)}" if failed else "")
+            + note, ephemeral=True)
+
     @app_commands.command(name="ping", description="Check the bot's latency")
     async def ping(self, interaction: discord.Interaction):
         ms = round(self.bot.latency * 1000) if self.bot.latency else 0
-        await interaction.response.send_message(f"Pong! Latency: {ms} ms", ephemeral=True)
-
-    @app_commands.command(name="uptime", description="Show how long the bot has been online")
-    async def uptime(self, interaction: discord.Interaction):
-        delta = datetime.now(timezone.utc) - self.bot.started_at  # type: ignore[attr-defined]
-        await interaction.response.send_message(f"Uptime: {delta.days}d {delta.seconds // 3600}h {(delta.seconds // 60) % 60}m", ephemeral=True)
-
-    @app_commands.command(name="serverinfo", description="Show information about this server")
-    async def serverinfo(self, interaction: discord.Interaction):
-        g = interaction.guild
-        await interaction.response.send_message(embed=emb(g.name, f"ID: {g.id}\nOwner: {g.owner}\nMembers: {g.member_count}\n"
-                f"Roles: {len(g.roles)}\nChannels: {len(g.channels)}\nCreated: {g.created_at:%Y-%m-%d}"), ephemeral=True)
+        status = "🟢 Excellent" if ms < 100 else "🟡 Good" if ms < 250 else "🔴 Slow"
+        await interaction.response.send_message(embed=_make("🏓 Pong!", fields=[("⏱️ Latency", f"{ms} ms", True), ("📶 Status", status, True)]), ephemeral=True)
 
     @app_commands.command(name="userinfo", description="Show information about a member")
     async def userinfo(self, interaction: discord.Interaction, member: discord.Member):
         roles = ", ".join(r.mention for r in member.roles[1:]) or "none"
-        await interaction.response.send_message(embed=emb(f"User: {member}", f"ID: {member.id}\nJoined: {member.joined_at:%Y-%m-%d %H:%M} UTC\n"
-                f"Account created: {member.created_at:%Y-%m-%d}\nHighest category: {highest_category(member)}\nRoles: {roles}"), ephemeral=True)
+        await interaction.response.send_message(embed=_make(f"👤 {member}", fields=[("🆔 ID", str(member.id), True), ("📅 Joined server", f"{member.joined_at:%Y-%m-%d %H:%M} UTC" if member.joined_at else "—", True), ("🎂 Account created", f"{member.created_at:%Y-%m-%d}", True), ("🏷️ Highest category", highest_category(member), True), ("🎖️ Roles", roles, False)], thumbnail=member.display_avatar.url), ephemeral=True)
 
     @app_commands.command(name="roleinfo", description="Show information about a role")
     async def roleinfo(self, interaction: discord.Interaction, role: discord.Role):
-        await interaction.response.send_message(embed=emb(f"Role: {role.name}", f"ID: {role.id}\nPosition: {role.position}\n"
-                f"Members: {len(role.members)}\nCategory: {categorize_role(role, interaction.guild)}\n"
-                f"Colour: {role.colour}\nMentionable: {role.mentionable}"), ephemeral=True)
+        await interaction.response.send_message(embed=_make(f"🎖️ {role.name}", fields=[("🆔 ID", str(role.id), True), ("📍 Position", str(role.position), True), ("👥 Members", str(len(role.members)), True), ("🏷️ Category", categorize_role(role, interaction.guild), True), ("🎨 Colour", str(role.colour), True), ("📣 Mentionable", "Yes" if role.mentionable else "No", True)]), ephemeral=True)
 
     @app_commands.command(name="avatar", description="Show a member's avatar")
     async def avatar(self, interaction: discord.Interaction, member: discord.Member):
-        await interaction.response.send_message(member.display_avatar.url, ephemeral=True)
+        embed = _make(f"🖼️ Avatar — {member}", thumbnail=member.display_avatar.url)
+        embed.set_image(url=member.display_avatar.url)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="roles", description="Audit every role: position, member count, and mapped category")
     async def roles(self, interaction: discord.Interaction):
@@ -80,22 +130,6 @@ class Utility(commands.Cog):
         text = "\n".join(lines) or "No roles."
         await interaction.response.send_message(embed=emb(f"Role Check: {member} (highest: {highest_category(member)})", text), ephemeral=True)
 
-    @app_commands.command(name="pingroles", description="List all notification / ping roles on this server")
-    async def pingroles(self, interaction: discord.Interaction):
-        roles = ping_roles(interaction.guild)
-        text = "\n".join(f"{r.name} — {len(r.members)} members" for r in roles) or "No ping roles found."
-        await interaction.response.send_message(embed=emb(f"Ping Roles ({len(roles)})", text), ephemeral=True)
-
-    @app_commands.command(name="channelinfo", description="Show information about a channel")
-    async def channelinfo(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await interaction.response.send_message(embed=emb(f"Channel: {channel.name}", f"ID: {channel.id}\nTopic: {channel.topic or '-'}\n"
-                f"Slowmode: {channel.slowmode_delay}s\nCategory: {channel.category}"), ephemeral=True)
-
-    @app_commands.command(name="botinfo", description="Show information about this bot")
-    async def botinfo(self, interaction: discord.Interaction):
-        await interaction.response.send_message(embed=emb("NEWR Support", f"User: {self.bot.user}\nGuilds: {len(self.bot.guilds)}\n"
-                f"Slash commands: see /help"), ephemeral=True)
-
     @app_commands.command(name="member_permissions", description="Show a member's key permissions")
     async def member_permissions(self, interaction: discord.Interaction, member: discord.Member):
         p = member.guild_permissions
@@ -108,21 +142,22 @@ class Utility(commands.Cog):
         names = ", ".join(m.mention for m in role.members[:50]) or "Nobody."
         await interaction.response.send_message(embed=emb(f"Members with {role.name} ({len(role.members)})", names), ephemeral=True)
 
-    @app_commands.command(name="top_roles", description="Show the top roles by position")
-    async def top_roles(self, interaction: discord.Interaction):
-        roles = sorted([r for r in interaction.guild.roles if r.name != "@everyone"], key=lambda r: r.position, reverse=True)[:15]
-        text = "\n".join(f"#{r.position} {r.name} — {len(r.members)} members" for r in roles)
-        await interaction.response.send_message(embed=emb("Top Roles", text), ephemeral=True)
-
     @app_commands.command(name="help", description="List all slash commands by category")
     async def help_cmd(self, interaction: discord.Interaction):
-        mapping = map_guild_roles(interaction.guild)
-        summary = ", ".join(f"{k}: {len(v)}" for k, v in mapping.items() if v)
         tip = smart.daily_tip()
-        await interaction.response.send_message(embed=emb("NEWR Support Help", "Use /ticket_create for help, /faq for answers (it fuzzy-matches, so exact wording is not needed), /verify to verify.\n"
-                f"Role categories on this server: {summary}\nFull command list: /command_list\n\n"
-                f"💡 Smart tip of the day ({tip['category']}): {tip['text']}\n"
-                "Tip categories: security, scam, support, safety, newr — the tip rotates daily, free and local, no AI key needed."), ephemeral=True)
+        embed = _make("📖 NEWR Support — Help",
+                      "Everything you need, in one place. Staff commands need a staff or top role.",
+                      thumbnail=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)
+        embed.add_field(name="🎟️ Get Help", value="`/ticket_create` — open a private ticket\n`/faq` — answers, fuzzy-matched\n`/report` — report a member\n`/suggest` · `/bug` · `/feedback`", inline=False)
+        embed.add_field(name="🔒 Verify", value="`/verify` — one captcha-gated panel in #✔️-verification\nNo role is given before a correct captcha answer.", inline=False)
+        embed.add_field(name="📝 Apply", value="`/apply submit` — staff application (form or DM)\nStaff review it in #apply and DM you the result.", inline=False)
+        embed.add_field(name="🛡️ Staff & Moderation", value="`/warn` · `/mute` · `/kick` · `/ban` · `/purge`\n`/ticket_list` · `/report_list` · `/appeal_list`\n`/backup` · `/say` · `/security_status`", inline=False)
+        embed.add_field(name="ℹ️ Info & Utility", value="`/userinfo` · `/roleinfo` · `/server_stats` · `/ping`\n`/roles` · `/rolecheck` · `/staff_list`", inline=False)
+        embed.add_field(name="⚠️ Channel Rule", value="Member commands only work in their designated channel (#🤖-bot-commands, #⚠️-reports, #💡-suggestions, #🐛-bug-reports, #📝-feedback, #🎟️-ticket). Staff and top roles are exempt.", inline=False)
+        embed.add_field(name=f"💡 Smart Tip — {tip['category']}", value=tip['text'], inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 
 
 async def setup(bot: commands.Bot) -> None:

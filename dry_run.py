@@ -39,11 +39,13 @@ async def main() -> int:
         print(f"{cog_name}: {n} slash commands")
         total += n
     tree_total = count_commands(bot.tree.get_commands())
-    print(f"TOTAL (cogs): {total}")
-    print(f"TOTAL (tree): {tree_total}")
-    assert 99 <= total <= 100, f"Total {total} slash commands, need 99-100 (Discord guild cap)"
-    assert 99 <= tree_total <= 100, f"Tree has {tree_total} slash commands, need 99-100"
-    print("OK: 99-100 slash commands, dry-run passed (no token used, no Discord connection).")
+    top_level = len(bot.tree.get_commands())
+    print(f"TOTAL leaf (cogs): {total}")
+    print(f"TOTAL leaf (tree): {tree_total}")
+    print(f"TOTAL top-level (Discord guild cap): {top_level}")
+    assert top_level <= 100, f"Top-level {top_level} exceeds Discord guild cap 100"
+    assert total >= 99, f"Leaf total {total} below 99"
+    print("OK: top-level within Discord cap, dry-run passed (no token used, no Discord connection).")
     return 0
 
 

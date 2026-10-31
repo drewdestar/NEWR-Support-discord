@@ -51,29 +51,29 @@ LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
 _DENIAL_COOLDOWN_SECONDS = 600  # one denial per user per burst
 
 STAFF_MENU = (
-    "👋 Halo, staff NEWR LABS! Kamu punya akses DM support.\n\n"
+    "👋 Hello, NEWR LABS staff! You have DM support access.\n\n"
     "**DM Staff Menu — NEWR Support**\n"
-    "• Kirim pesan apa pun di DM ini untuk membuat support request baru.\n"
-    "  Request-nya tersimpan dan diteruskan ke log channel staff kalau sudah disetel.\n"
-    "• Ketik `menu` untuk melihat menu ini lagi.\n"
-    "• Untuk tiket penuh di server, pakai `/ticket_create` di NEWR LABS.\n"
-    "• Cek akses DM kamu kapan saja dari server dengan `/dm-access`."
+    "• Send any message in this DM to create a new support request.\n"
+    "  The request is saved and forwarded to the staff log channel if one is set.\n"
+    "• Type `menu` to see this menu again.\n"
+    "• For a full ticket in the server, use `/ticket_create` in NEWR LABS.\n"
+    "• Check your DM access anytime from the server with `/dm-access`."
 )
 
 MEMBER_DENIAL = (
-    "Halo! Maaf ya, DM support NEWR Support hanya untuk staff dan role "
-    "tertinggi NEWR LABS saja, jadi DM ini tidak bisa diproses sebagai "
+    "Hello! Sorry, NEWR Support DM support is only for staff and the "
+    "top NEWR LABS roles, so this DM cannot be processed as a "
     "support request.\n\n"
-    "Kalau kamu member, silakan pakai `/ticket_create` di server NEWR LABS, "
-    "staff akan bantu kamu di sana. Terima kasih sudah menghubungi kami!"
+    "If you are a member, please use `/ticket_create` in the NEWR LABS server, "
+    "staff will help you there. Thanks for reaching out!"
 )
 
 NON_MEMBER_DENIAL = (
-    "Halo! Maaf ya, DM support NEWR Support hanya untuk staff dan role "
-    "tertinggi NEWR LABS saja. Kamu belum terdaftar sebagai member NEWR LABS, "
-    "jadi DM ini tidak bisa diproses.\n\n"
-    "Silakan join server NEWR LABS dulu, lalu pakai `/ticket_create` di "
-    "server kalau kamu butuh bantuan. Terima kasih!"
+    "Hello! Sorry, NEWR Support DM support is only for staff and the "
+    "top NEWR LABS roles. You are not registered as a NEWR LABS member, "
+    "so this DM cannot be processed.\n\n"
+    "Please join the NEWR LABS server first, then use `/ticket_create` in "
+    "the server if you need help. Thanks!"
 )
 
 
@@ -114,12 +114,23 @@ class DMGate(commands.Cog):
         # DM only: guild messages are handled by the other cogs.
         if message.author.bot or message.guild is not None:
             return
+        # A DM application owns the DM while it is in progress: each
+        # answer (position, experience, reason, availability) is an
+        # application answer, NOT a support request. Without this
+        # guard, one DM application spams #logs with one support
+        # request per answer, plus a "saved as #N" reply per answer.
+        with db._conn() as conn:
+            in_application = conn.execute(
+                "SELECT 1 FROM dm_applications WHERE user_id=? LIMIT 1",
+                (message.author.id,)).fetchone() is not None
+        if in_application:
+            return
         user = message.author
         guild, member = await _resolve_member(self.bot, user.id)
         if guild is None:
             await message.channel.send(
-                "Maaf, bot belum terhubung ke server NEWR LABS, jadi akses DM "
-                "belum bisa diverifikasi. Silakan pakai /ticket_create di server NEWR LABS.")
+                "Sorry, the bot is not connected to the NEWR LABS server yet, so DM "
+                "access cannot be verified. Please use /ticket_create in the NEWR LABS server.")
             return
         if member is None or not is_dm_staff(member):
             # One denial per burst: reply once, then ignore repeats for
@@ -135,7 +146,13 @@ class DMGate(commands.Cog):
         text = (message.content or "").strip()
         if not text or text.lower() in ("menu", "help", "halo", "hi", "hello"):
             tip = smart.daily_tip()
-            await message.channel.send(STAFF_MENU + f"\n\n💡 Tip of the day ({tip['category']}): {tip['text']}")
+            from cogs.ui import make as _make
+            await message.channel.send(embed=_make("👋 NEWR LABS Staff — DM Menu",
+                "You have DM support access.",
+                fields=[("📩 New Request", "Send any message in this DM to create a support request.", False),
+                        ("🎟️ Full Ticket", "Use `/ticket_create` in NEWR LABS for a full ticket.", False),
+                        ("🔁 Menu", "Type `menu` to see this menu again.", False),
+                        (f"💡 Tip of the day — {tip['category']}", tip['text'], False)]))
             return
         # Staff-only smart tip in DM (on_message): "tip"/"tips" returns the
         # rotating local tip instead of being stored as a support request.
@@ -153,17 +170,17 @@ class DMGate(commands.Cog):
             if isinstance(channel, discord.TextChannel):
                 try:
                     await channel.send(
-                        f"📩 **DM support request #{request_id}** dari {user.mention} "
+                        f"📩 **DM support request #{request_id}** from {user.mention} "
                         f"({user}, staff roles: {', '.join(r.name for r in dm_staff_roles(member))})\n"
                         f"> {text[:1000]}")
                 except discord.HTTPException:
                     pass
         await message.channel.send(
-            f"✅ Support request DM kamu tersimpan sebagai **#{request_id}**.\n"
+            f"✅ Your DM support request has been saved as **#{request_id}**.\n"
             f"{smart.triage_text(text)}\n"
-            f"Staff bisa menindaklanjuti dari log channel, atau kamu bisa buat tiket penuh "
-            f"di server dengan `/ticket_create`. Kirim pesan lagi di DM ini untuk request baru, "
-            f"atau ketik `menu` untuk menu staff.")
+            f"Staff can follow up from the log channel, or you can open a full ticket "
+            f"in the server with `/ticket_create`. Send another message in this DM for a new request, "
+            f"or type `menu` for the staff menu.")
 
     @app_commands.command(name="dm-access", description="Check whether you have staff DM access to NEWR Support")
     async def dm_access(self, interaction: discord.Interaction):
@@ -171,8 +188,8 @@ class DMGate(commands.Cog):
         # expected to run inside a server; handle a DM invocation anyway.
         if interaction.guild is None:
             await interaction.response.send_message(
-                "Perintah ini hanya bisa dicek dari dalam server. DM support sendiri "
-                "berjalan lewat pesan DM (bukan slash command di DM) — lihat README.",
+                "This command can only be checked from inside the server. DM support itself "
+                "runs via DM messages (not a slash command in DM) — see the README.",
                 ephemeral=True)
             return
         _, member = await _resolve_member(
@@ -181,9 +198,9 @@ class DMGate(commands.Cog):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="DM Access: Non-member",
-                    description=("Kamu belum terdaftar sebagai member NEWR LABS, jadi kamu "
-                                 "tidak punya akses DM support. Join server NEWR LABS dulu, "
-                                 "lalu pakai /ticket_create di server kalau butuh bantuan."),
+                    description=("You are not registered as a NEWR LABS member, so you "
+                                 "do not have DM support access. Join the NEWR LABS server first, "
+                                 "then use /ticket_create in the server if you need help."),
                     color=0xED4245, timestamp=datetime.now(timezone.utc)),
                 ephemeral=True)
             return
@@ -192,19 +209,19 @@ class DMGate(commands.Cog):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="DM Access: Staff ✅",
-                    description=("Kamu punya akses DM support NEWR Support.\n"
-                                 f"Role staff/top kamu: {', '.join(r.name for r in staff_roles) or 'guild owner'}\n"
-                                 "Kirim DM ke bot ini untuk membuat support request, atau ketik `menu` di DM."),
+                    description=("You have NEWR Support DM support access.\n"
+                                 f"Your staff/top roles: {', '.join(r.name for r in staff_roles) or 'guild owner'}\n"
+                                 "DM this bot to create a support request, or type `menu` in DM."),
                     color=0x57F287, timestamp=datetime.now(timezone.utc)),
                 ephemeral=True)
             return
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="DM Access: Member only",
-                description=("DM support NEWR Support hanya untuk staff dan role tertinggi "
+                description=("NEWR Support DM support is only for staff and the top roles "
                              "(FOUNDER, 👑 Founder, NEWR, 🏛️ Executive, ⭐ Admin, 🛡️ Senior Mod, "
                              "⚔️ Moderator, 🎯 Team Lead, 🤝 Helper, Security).\n"
-                             "Sebagai member, silakan pakai /ticket_create di server NEWR LABS."),
+                             "As a member, please use /ticket_create in the NEWR LABS server."),
                 color=0xFEE75C, timestamp=datetime.now(timezone.utc)),
             ephemeral=True)
 

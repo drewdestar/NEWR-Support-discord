@@ -45,6 +45,21 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS feedback(
             id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
             author_id INTEGER, rating INTEGER, comment TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS command_offenses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+            user_id INTEGER, command TEXT, channel_id INTEGER, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS applications(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+            user_id INTEGER, position TEXT, experience TEXT, reason TEXT,
+            availability TEXT, status TEXT, reviewer_id INTEGER,
+            review_reason TEXT, message_id INTEGER, channel_id INTEGER,
+            created_at TEXT);
+        CREATE TABLE IF NOT EXISTS verify_captchas(
+            user_id INTEGER, guild_id INTEGER, code TEXT, created_at TEXT,
+            PRIMARY KEY (user_id, guild_id));
+        CREATE TABLE IF NOT EXISTS apply_positions(
+            guild_id INTEGER, position TEXT,
+            PRIMARY KEY (guild_id, position));
         CREATE TABLE IF NOT EXISTS watchlist(
             guild_id INTEGER, user_id INTEGER, reason TEXT,
             PRIMARY KEY (guild_id, user_id));
@@ -56,7 +71,42 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS dm_requests(
             id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
             user_id INTEGER, text TEXT, status TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS automod_violations(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+            user_id INTEGER, kind TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS ticket_close_requests(
+            channel_id INTEGER PRIMARY KEY, guild_id INTEGER,
+            requested_by INTEGER, requested_at TEXT);
+        CREATE TABLE IF NOT EXISTS image_captchas(
+            user_id INTEGER, guild_id INTEGER, code TEXT, created_at TEXT,
+            PRIMARY KEY (user_id, guild_id));
+        CREATE TABLE IF NOT EXISTS ticket_bans(
+            user_id INTEGER, guild_id INTEGER, expires_at TEXT, reason TEXT,
+            banned_by INTEGER, created_at TEXT,
+            PRIMARY KEY (user_id, guild_id));
+        CREATE TABLE IF NOT EXISTS dm_applications(
+            user_id INTEGER, guild_id INTEGER, step INTEGER,
+            position TEXT, experience TEXT, reason TEXT, availability TEXT,
+            created_at TEXT, PRIMARY KEY (user_id, guild_id));
+        CREATE TABLE IF NOT EXISTS captcha_join_attempts(
+            user_id INTEGER, guild_id INTEGER, attempts INTEGER, window_start TEXT,
+            PRIMARY KEY (user_id, guild_id));
         """)
+    # Migrations for the report/appeal flow (safe on old DBs: only add
+    # columns that are missing; existing rows get NULL/default).
+    for table, cols in {
+        "reports": ["category TEXT", "status TEXT", "action TEXT",
+                    "message_id INTEGER", "channel_id INTEGER"],
+        "appeals": ["kind TEXT", "ref_id INTEGER", "status TEXT",
+                    "target_id INTEGER", "message_id INTEGER",
+                    "channel_id INTEGER"],
+        "tickets": ["priority TEXT"],
+        "applications": ["closed_at TEXT"],
+    }.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col in cols:
+            if col.split()[0] not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     # A small default FAQ set is inserted only when the table is empty.
     with _conn() as conn:
         if conn.execute("SELECT COUNT(*) FROM faqs").fetchone()[0] == 0:
