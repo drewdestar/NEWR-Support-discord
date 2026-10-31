@@ -83,7 +83,16 @@ class VerifyImageModal(discord.ui.Modal, title="Human Check"):
         self.add_item(self.answer_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        from cogs.ui import err, ok as ok_embed
+        from cogs.ui import err, ok as ok_embed, panel
+        from roles import categorize_role
+        # Already verified beats "expired": after a correct answer the
+        # row is deleted, so a second (stale) modal submit must not
+        # report "Captcha Expired" to an already-verified user.
+        verified = [r for r in interaction.guild.roles if categorize_role(r, interaction.guild) == "verified"]  # type: ignore[attr-defined]
+        if verified and any(r in interaction.user.roles for r in verified):  # type: ignore[attr-defined]
+            await interaction.response.send_message(
+                embed=panel("✅ Already Verified", "You already have the Verified role — no captcha needed."),
+                ephemeral=True); return
         with db._conn() as conn:
             row = conn.execute("SELECT code FROM verify_captchas WHERE user_id=? AND guild_id=?",
                                (interaction.user.id, interaction.guild.id)).fetchone()
@@ -99,11 +108,22 @@ class VerifyImageModal(discord.ui.Modal, title="Human Check"):
                 await interaction.response.send_message(embed=err("Verification Failed", "No verified role found on this server."), ephemeral=True); return
             await interaction.response.send_message(embed=ok_embed("Verified!", "✅ Correct! You now have the Verified role and can access the server."), ephemeral=True)
         else:
-            await interaction.response.send_message(embed=err("Wrong Answer", "That code was wrong. Click Verify again for a new image — no role was given."), ephemeral=True)
+            # Row is NOT deleted on a wrong answer: the same captcha
+            # stays active, so the user retries the same image
+            # (via Enter Answer) instead of spamming Verify for a
+            # new, easier code.
+            await interaction.response.send_message(embed=err("Wrong Answer", "That code was wrong. Your current captcha is still active — try again with the same image (Enter Answer). Tip: if the modal hides the image on your phone, close it and use 'Answer in DM' on the captcha message instead — the image stays visible in your DM chat while you type. No role was given."), ephemeral=True)
 
 
 class VerifyAnswerView(discord.ui.View):
-    """Ephemeral answer button attached to the captcha image message."""
+    """Ephemeral answer buttons attached to the captcha image message.
+
+    Discord modals cannot contain an image, so on mobile the modal
+    covers the captcha image while the user types — they have to
+    remember the code. 'Answer in DM' is the workaround: the bot
+    DMs the same image, and in a DM chat the image stays visible
+    above the keyboard while the user types their reply.
+    """
     def __init__(self) -> None:
         super().__init__(timeout=600)
 
@@ -111,12 +131,46 @@ class VerifyAnswerView(discord.ui.View):
     async def answer(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await interaction.response.send_modal(VerifyImageModal())
 
+    @discord.ui.button(label="Answer in DM", style=discord.ButtonStyle.secondary)
+    async def answer_dm(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        import io as _io
+        from cogs.ui import err, panel
+        with db._conn() as conn:
+            row = conn.execute("SELECT code, created_at FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                               (interaction.user.id, interaction.guild.id)).fetchone()
+        if row is None:
+            await interaction.response.send_message(
+                embed=err("Captcha Expired", "Click Verify again for a new image."), ephemeral=True); return
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))).total_seconds()
+        except Exception:
+            age = 999999
+        if age >= 600:
+            with db._conn() as conn:
+                conn.execute("DELETE FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                             (interaction.user.id, interaction.guild.id))
+            await interaction.response.send_message(
+                embed=err("Captcha Expired", "Click Verify again for a new image."), ephemeral=True); return
+        try:
+            dm_msg = await interaction.user.send(
+                embed=panel("🔒 Human Check", "Reply to this DM with the code from the image below. You can see the image above while you type. If your answer is wrong, this message is automatically deleted and a fresh copy of the same captcha is sent."),
+                file=discord.File(_io.BytesIO(_make_captcha_image(row["code"])), filename="captcha.png"))
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                embed=err("DMs Closed", "I could not DM you — your DMs are closed. Use 'Enter Answer' (modal) instead."), ephemeral=True); return
+        with db._conn() as conn:
+            conn.execute("UPDATE verify_captchas SET dm_message_id=? WHERE user_id=? AND guild_id=?",
+                         (dm_msg.id, interaction.user.id, interaction.guild.id))
+        await interaction.response.send_message(
+            embed=panel("📩 Check Your DM", "I sent the same captcha image to your DM. Reply there with the code — the image stays visible while you type."),
+            ephemeral=True)
+
 
 class VerifyView(discord.ui.View):
     """THE verification panel: one button, one image captcha, no bypass.
 
     Clicking Verify never grants Verified directly. It generates a
-    NEW image captcha every click (letters + digits, rendered as a
+    One image captcha at a time (letters + digits, rendered as a
     picture, not a math question), sends it as an ephemeral message
     in-server (no DM needed, so closed DMs cannot block it), and
     only a correct typed answer calls _verify_member. There is no
@@ -137,15 +191,46 @@ class VerifyView(discord.ui.View):
             await interaction.response.send_message(
                 embed=panel("✅ Already Verified", "You already have the Verified role — no captcha needed."),
                 ephemeral=True); return
-        code = _new_verify_code()
+        # Anti-spam: only ONE captcha message per active captcha.
+        # If they already have one (unanswered, less than 10
+        # minutes old), this click is silently acknowledged and
+        # NOTHING new is sent at all. After 10 minutes the old
+        # one is expired and a new one is allowed, so a user is
+        # never stuck forever on a lost/expired image.
         with db._conn() as conn:
-            conn.execute(
-                "INSERT INTO verify_captchas VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(user_id, guild_id) DO UPDATE SET code=excluded.code, created_at=excluded.created_at",
-                (member.id, interaction.guild.id, code, db.now()))
+            existing = conn.execute("SELECT code, created_at FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                                    (member.id, interaction.guild.id)).fetchone()
+        if existing is not None:
+            try:
+                from datetime import datetime as _dt
+                age = (_dt.now(timezone.utc) - _dt.fromisoformat(existing["created_at"].replace("Z", "+00:00"))).total_seconds()
+            except Exception:
+                age = 999999
+            if age < 600:
+                # Only ONE captcha message, ever, per active captcha:
+                # silently acknowledge this click and send NOTHING
+                # new. Resending the same image still stacks a new
+                # ephemeral message on every click, which is exactly
+                # the spam in the user's screenshot. The user already
+                # has the one active message to answer.
+                await interaction.response.defer_update()
+                return
+            else:
+                with db._conn() as conn:
+                    conn.execute("DELETE FROM verify_captchas WHERE user_id=? AND guild_id=?",
+                                 (member.id, interaction.guild.id))
+                code = _new_verify_code()
+                with db._conn() as conn:
+                    conn.execute("INSERT INTO verify_captchas VALUES (?, ?, ?, ?)",
+                                 (member.id, interaction.guild.id, code, db.now()))
+        else:
+            code = _new_verify_code()
+            with db._conn() as conn:
+                conn.execute("INSERT INTO verify_captchas VALUES (?, ?, ?, ?)",
+                             (member.id, interaction.guild.id, code, db.now()))
         try:
             await interaction.response.send_message(
-                embed=panel("🔒 Human Check", "Type the code shown in the image below, then click Enter Answer. A new image is generated every time you click Verify."),
+                embed=panel("🔒 Human Check", "Type the code shown in the image below, then click Enter Answer. You can only have one active captcha at a time — clicking Verify again while this one is active will not send another message, so answer this one. On a phone the modal can hide this image while you type: use 'Answer in DM' below instead and the image stays visible in your DM chat while you type."),
                 file=discord.File(_io.BytesIO(_make_captcha_image(code)), filename="captcha.png"),
                 view=VerifyAnswerView(), ephemeral=True)
         except discord.HTTPException:
@@ -270,6 +355,83 @@ class Security(commands.Cog):
         if message.author.bot:
             return
         if not message.guild:
+            # DM reply to a VERIFY captcha sent via 'Answer in DM':
+            # only active when dm_message_id is set (user actually
+            # chose the DM path). Unlike the ephemeral in-server
+            # message, a real DM message CAN be deleted by the bot,
+            # so a wrong answer auto-deletes the old captcha
+            # message and sends a fresh copy of the SAME code.
+            # If the reply matches a captcha-on-join code instead,
+            # fall through to the image_captchas handler below.
+            with db._conn() as conn:
+                vrow = conn.execute(
+                    "SELECT guild_id, code, created_at, dm_message_id FROM verify_captchas WHERE user_id=? AND dm_message_id IS NOT NULL",
+                    (message.author.id,)).fetchone()
+            if vrow is not None:
+                # Join-captcha match takes precedence: fall through.
+                with db._conn() as conn:
+                    irow = conn.execute(
+                        "SELECT code FROM image_captchas WHERE user_id=? LIMIT 1",
+                        (message.author.id,)).fetchone()
+                    in_app = conn.execute(
+                        "SELECT 1 FROM dm_applications WHERE user_id=? LIMIT 1",
+                        (message.author.id,)).fetchone() is not None
+                content = message.content.strip().upper()
+                if irow is not None and content == irow["code"].upper() and content != vrow["code"].upper():
+                    pass  # join captcha: fall through to handler below
+                elif in_app and content != vrow["code"].upper():
+                    return  # DM application answer, not a captcha attempt
+                else:
+                    async def _delete_dm_captcha() -> None:
+                        if vrow["dm_message_id"]:
+                            try:
+                                old = await message.channel.fetch_message(vrow["dm_message_id"])
+                                await old.delete()
+                            except Exception:
+                                pass
+                    try:
+                        vcreated = datetime.fromisoformat(vrow["created_at"])
+                        if vcreated.tzinfo is None:
+                            vcreated = vcreated.replace(tzinfo=timezone.utc)
+                        vexpired = (datetime.now(timezone.utc) - vcreated) > timedelta(minutes=10)
+                    except Exception:
+                        vexpired = True
+                    if vexpired:
+                        await _delete_dm_captcha()
+                        with db._conn() as conn:
+                            conn.execute("DELETE FROM verify_captchas WHERE user_id=?", (message.author.id,))
+                        await message.channel.send("That captcha expired (10 minutes). Please click Verify in #verification again.")
+                        return
+                    if content == vrow["code"].upper():
+                        await _delete_dm_captcha()
+                        with db._conn() as conn:
+                            conn.execute("DELETE FROM verify_captchas WHERE user_id=?", (message.author.id,))
+                        vguild = self.bot.get_guild(vrow["guild_id"])
+                        if vguild is None:
+                            await message.channel.send("Server not found. Please try again in the server."); return
+                        vmember = vguild.get_member(message.author.id)
+                        if vmember is None:
+                            await message.channel.send("You are not in the server anymore."); return
+                        vok = await _verify_member(vguild, vmember, "captcha (image verify, DM answer)")
+                        await message.channel.send("✅ Correct! You are verified!" if vok else "No verified role found on this server.")
+                        return
+                    # Wrong: auto-delete the old DM captcha message,
+                    # then resend the SAME code as a fresh DM message
+                    # (no code refresh, so wrong answers cannot be
+                    # used to fish for an easier code).
+                    await _delete_dm_captcha()
+                    import io as _io2
+                    from cogs.ui import panel as _panel
+                    try:
+                        new_dm = await message.channel.send(
+                            embed=_panel("🔒 Human Check", "❌ Wrong code. The old captcha message was deleted. Reply to this DM with the code from the image below — you can see it above while you type."),
+                            file=discord.File(_io2.BytesIO(_make_captcha_image(vrow["code"])), filename="captcha.png"))
+                        with db._conn() as conn:
+                            conn.execute("UPDATE verify_captchas SET dm_message_id=? WHERE user_id=? AND guild_id=?",
+                                         (new_dm.id, message.author.id, vrow["guild_id"]))
+                    except Exception:
+                        await message.channel.send("❌ Wrong code. Click Verify in #verification to try again.")
+                    return
             # DM reply to an image captcha: check the code, verify
             # in the stored guild, expire after 10 minutes.
             with db._conn() as conn:

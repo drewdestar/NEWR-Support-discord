@@ -102,6 +102,7 @@ def init_db() -> None:
                     "channel_id INTEGER"],
         "tickets": ["priority TEXT"],
         "applications": ["closed_at TEXT"],
+        "verify_captchas": ["dm_message_id INTEGER"],
     }.items():
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for col in cols:
